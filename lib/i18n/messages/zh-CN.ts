@@ -406,6 +406,8 @@ export const zhCNLocale: LocalePlugin = {
     "chat.searching": "搜索中…",
     "chat.noMatchingFiles": "未找到匹配的文件",
     "chat.searchingAll": " · 正在搜索所有文件…",
+    "chat.extensionSuggestions": "扩展建议 · {count}",
+    "chat.noMatchingSuggestions": "没有匹配的建议",
     "chat.indexTruncated": " · 索引不完整",
     "chat.steerPlaceholder": "立即引导 / 排队后续消息...",
     "chat.agentPlaceholder": "Agent 运行中…",

@@ -406,6 +406,8 @@ export const zhTWLocale: LocalePlugin = {
     "chat.searching": "搜尋中…",
     "chat.noMatchingFiles": "找不到相符的檔案",
     "chat.searchingAll": " · 正在搜尋所有檔案…",
+    "chat.extensionSuggestions": "擴充功能建議 · {count}",
+    "chat.noMatchingSuggestions": "找不到相符的建議",
     "chat.indexTruncated": " · 索引已截斷",
     "chat.steerPlaceholder": "立即引導 / 將後續訊息排入佇列...",
     "chat.agentPlaceholder": "Agent 執行中…",

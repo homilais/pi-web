@@ -406,6 +406,8 @@ export const enLocale: LocalePlugin = {
     "chat.searching": "Searching…",
     "chat.noMatchingFiles": "No matching files",
     "chat.searchingAll": " · searching all files…",
+    "chat.extensionSuggestions": "Extension suggestions · {count}",
+    "chat.noMatchingSuggestions": "No matching suggestions",
     "chat.indexTruncated": " · index truncated",
     "chat.steerPlaceholder": "Steer now / queue follow-up...",
     "chat.agentPlaceholder": "Agent is running…",

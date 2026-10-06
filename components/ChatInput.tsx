@@ -22,6 +22,13 @@ import {
   buildEntriesFromFiles, buildAtInsertText, extractAtQuery, filterFileEntries,
   type AtQueryMatch, type FileIndexEntry,
 } from "@/lib/file-fuzzy";
+import {
+  buildExtensionInsertText,
+  matchExtensionTriggerToken,
+  type ExtensionAutocompleteItem,
+  type ExtensionAutocompleteRequest,
+  type ExtensionAutocompleteResult,
+} from "@/lib/extension-autocomplete";
 import { getMarkdownListContinuation } from "@/lib/markdown-list-continuation";
 import { isBareMcpCommand, isBuiltinMcpCommand } from "@/lib/mcp-command";
 import { FolderIcon, getFileIcon } from "./FileIcons";
@@ -95,6 +102,10 @@ interface Props {
   draftKey?: string;
   /** Session working directory — enables the @ file autocomplete menu */
   cwd?: string | null;
+  /** Session id — enables the extension autocomplete flow (@skill: etc.) */
+  sessionId?: string | null;
+  /** Latest `autocomplete_result` event for this session, from the SSE stream. */
+  extensionAutocompleteResult?: ExtensionAutocompleteResult | null;
 }
 
 export interface ChatInputHandle {
@@ -120,6 +131,10 @@ const TOOL_PRESET_MAP: Record<ToolPresetLabel, ToolPreset> = {
 const COMPOSITION_END_ENTER_GRACE_MS = 100;
 const TEXT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 const ANCHORED_MENU_GAP = 8;
+// Extension autocomplete request pacing: bursts of keystrokes coalesce into
+// one provider call, and a provider that never answers cannot hold the popup.
+const EXTENSION_AUTOCOMPLETE_DEBOUNCE_MS = 250;
+const EXTENSION_AUTOCOMPLETE_TIMEOUT_MS = 3_000;
 
 export function getUpwardMenuMaxHeight(menuBottom: number, visibleTop: number, gap = ANCHORED_MENU_GAP): number {
   return Math.max(0, Math.floor(menuBottom - visibleTop - gap));
@@ -597,6 +612,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   onPromptWithStreamingBehavior,
   draftKey,
   cwd,
+  sessionId,
+  extensionAutocompleteResult,
   compact = false,
 }: Props, ref) {
   const { t } = useI18n();
@@ -620,6 +637,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
   const [atMenuOpen, setAtMenuOpen] = useState(false);
   const [atMenuMaxHeight, setAtMenuMaxHeight] = useState<number | null>(null);
   const [atActiveIndex, setAtActiveIndex] = useState(0);
+  // Extension autocomplete (@skill:): suggestions answered by the session's
+  // extension providers, requested debounced and matched back by requestId.
+  const [extensionSuggestions, setExtensionSuggestions] = useState<ExtensionAutocompleteItem[]>([]);
+  const autocompleteRequestTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autocompleteRequestControllerRef = useRef<AbortController | null>(null);
+  const autocompleteRequestRef = useRef<string | null>(null);
   const [imageWarningDismissed, setImageWarningDismissed] = useState(false);
   const [historyMenuOpen, setHistoryMenuOpen] = useState(false);
   const [historyActiveIndex, setHistoryActiveIndex] = useState(0);
@@ -1104,6 +1127,87 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     && atServerResult.query === atQueryText;
   const atMatches: FileIndexEntry[] = serverResultInUse ? atServerResult.matches : atLocalMatches;
 
+  // Extension autocomplete: when the @token is an extension trigger (e.g.
+  // "@skill:co"), suggestions come from the session's extension providers via
+  // the get_autocomplete RPC instead of the local file index.
+  const extensionTrigger = atQuery && !atQuery.quoted
+    ? matchExtensionTriggerToken(`@${atQuery.query}`)
+    : null;
+  const extensionTriggerKey = extensionTrigger ? `${extensionTrigger.trigger}\u0000${extensionTrigger.query}` : null;
+
+  useEffect(() => {
+    if (extensionTrigger === null || !sessionId) {
+      setExtensionSuggestions([]);
+      return;
+    }
+    const ta = textareaRef.current;
+    const cursor = ta?.selectionStart ?? value.length;
+    const beforeCursor = value.slice(0, cursor);
+    const cursorLine = beforeCursor.split("\n").length - 1;
+    const lineStart = beforeCursor.lastIndexOf("\n") + 1;
+    const cursorCol = cursor - lineStart;
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const controller = new AbortController();
+    const trigger = extensionTrigger.trigger;
+    const query = extensionTrigger.query;
+    // Debounce: only the last keystroke of a burst asks the provider.
+    const timer = setTimeout(() => {
+      autocompleteRequestRef.current = requestId;
+      autocompleteRequestControllerRef.current = controller;
+      const send = async () => {
+        try {
+          const res = await fetch(`/api/agent/${encodeURIComponent(sessionId)}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              type: "get_autocomplete",
+              requestId,
+              prefix: query,
+              trigger,
+              text: value,
+              cursorLine,
+              cursorCol,
+            } as ExtensionAutocompleteRequest),
+            signal: controller.signal,
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const body = await res.json() as { data?: Partial<ExtensionAutocompleteResult> };
+          const data = body.data;
+          if (data?.type === "autocomplete_result" && data.requestId === requestId && autocompleteRequestRef.current === requestId) {
+            setExtensionSuggestions(Array.isArray(data.items) ? data.items as ExtensionAutocompleteItem[] : []);
+          }
+        } catch (e) {
+          if (!(e instanceof DOMException && e.name === "AbortError")) {
+            console.error("[pi-web] autocomplete request error:", e instanceof Error ? e.message : e);
+          }
+          if (autocompleteRequestRef.current === requestId) setExtensionSuggestions([]);
+        }
+      };
+      void send();
+    }, EXTENSION_AUTOCOMPLETE_DEBOUNCE_MS);
+    // 3s without an answer abandons the request; typing retries.
+    const timeout = setTimeout(() => controller.abort(), EXTENSION_AUTOCOMPLETE_TIMEOUT_MS);
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(timeout);
+      controller.abort();
+    };
+    // value/cursor are read fresh through the refs captured here; only the
+    // trigger/query identity drives re-requesting, so caret-only moves and
+    // unrelated edits never churn the server.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extensionTriggerKey, sessionId]);
+
+  // The same result also arrives over the session's SSE stream; accept it for
+  // the request still in flight so a slow POST round-trip cannot beat it.
+  useEffect(() => {
+    if (!extensionAutocompleteResult?.requestId) return;
+    if (extensionAutocompleteResult.requestId !== autocompleteRequestRef.current) return;
+    setExtensionSuggestions(Array.isArray(extensionAutocompleteResult.items)
+      ? extensionAutocompleteResult.items as ExtensionAutocompleteItem[]
+      : []);
+  }, [extensionAutocompleteResult]);
+
   // Open/reset the menu whenever the @token appears or changes (mirrors the
   // slash menu: Escape closes it, the next keystroke re-opens it).
   const atTokenKey = atQuery === null ? null : `${atQuery.start}:${atQuery.quoted ? 1 : 0}:${atQuery.query}`;
@@ -1177,15 +1281,51 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
     });
   }, [atQuery, value]);
 
-  useEffect(() => {
-    if (atActiveIndex >= atMatches.length) {
-      setAtActiveIndex(Math.max(0, atMatches.length - 1));
-    }
-  }, [atMatches.length, atActiveIndex]);
+  // Extension suggestions replace the trigger token with trigger + value +
+  // space (see buildExtensionInsertText); the token stays open so further
+  // typing keeps refining the same provider query.
+  const applyExtensionCompletion = useCallback((item: ExtensionAutocompleteItem) => {
+    if (!atQuery || !extensionTrigger) return;
+    const ta = textareaRef.current;
+    const cursor = ta?.selectionStart ?? value.length;
+    const before = value.slice(0, atQuery.start);
+    const after = value.slice(cursor);
+    const insert = buildExtensionInsertText(extensionTrigger.trigger, item);
+    const newValue = before + insert.text + after;
+    const newPos = before.length + insert.cursorOffset;
+    setValue(newValue);
+    setAtQuery(extractAtQuery(newValue.slice(0, newPos)));
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(newPos, newPos);
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    });
+  }, [atQuery, value, extensionTrigger]);
+
+  type AtPopupItem =
+    | { kind: "file"; entry: FileIndexEntry }
+    | { kind: "extension"; item: ExtensionAutocompleteItem };
+  const atPopupItems: AtPopupItem[] = extensionTrigger !== null
+    ? extensionSuggestions.map((item) => ({ kind: "extension" as const, item }))
+    : atMatches.map((entry) => ({ kind: "file" as const, entry }));
+
+  const applyAtPopupCompletion = useCallback((popup: AtPopupItem) => {
+    if (popup.kind === "extension") applyExtensionCompletion(popup.item);
+    else applyAtCompletion(popup.entry);
+  }, [applyExtensionCompletion, applyAtCompletion]);
 
   useEffect(() => {
-    atItemRefs.current.length = atMatches.length;
-  }, [atMatches.length]);
+    if (atActiveIndex >= atPopupItems.length) {
+      setAtActiveIndex(Math.max(0, atPopupItems.length - 1));
+    }
+  }, [atPopupItems.length, atActiveIndex]);
+
+  useEffect(() => {
+    atItemRefs.current.length = atPopupItems.length;
+  }, [atPopupItems.length]);
 
   useEffect(() => {
     if (!atMenuOpen) return;
@@ -1403,17 +1543,17 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
 
-      // @ file menu — skip while composing so IME candidate navigation
-      // (arrows/Enter/Tab) is never intercepted.
+      // @ file/extension menu — skip while composing so IME candidate
+      // navigation (arrows/Enter/Tab) is never intercepted.
       if (atMenuOpen && atQuery !== null && !isComposing) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
-          setAtActiveIndex((i) => cycleListIndex(i, atMatches.length, 1));
+          setAtActiveIndex((i) => cycleListIndex(i, atPopupItems.length, 1));
           return;
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
-          setAtActiveIndex((i) => cycleListIndex(i, atMatches.length, -1));
+          setAtActiveIndex((i) => cycleListIndex(i, atPopupItems.length, -1));
           return;
         }
         if (e.key === "Escape") {
@@ -1421,9 +1561,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           setAtMenuOpen(false);
           return;
         }
-        if ((e.key === "Tab" || acceptShortcut) && atMatches[atActiveIndex]) {
+        if ((e.key === "Tab" || acceptShortcut) && atPopupItems[atActiveIndex]) {
           e.preventDefault();
-          applyAtCompletion(atMatches[atActiveIndex]);
+          applyAtPopupCompletion(atPopupItems[atActiveIndex]);
           return;
         }
       }
@@ -1453,7 +1593,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
         }
       }
     },
-    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atMatches, atActiveIndex, applyAtCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
+    [isMobile, enterSendMode, isStreaming, onSteer, onFollowUp, onAbort, slashMenuOpen, slashQuery, displayedSlashCommands, slashActiveIndex, applySlashCommand, sendQueued, handleSend, getNextSlashIndex, atMenuOpen, atQuery, atPopupItems, atActiveIndex, applyAtPopupCompletion, historyMenuOpen, inputHistory, historyActiveIndex, applyHistoryInput, value]
   );
 
   const handleInput = useCallback(() => {
@@ -2080,13 +2220,17 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             </div>
           )}
           {atMenuOpen && atQuery !== null && (() => {
+            const extensionMode = extensionTrigger !== null;
             const indexLoading = fileIndexLoading && (!fileIndex || fileIndex.cwd !== cwd);
-             const matchCountLabel = atMatches.length === 1 ? t("chat.match") : t("chat.matches", { count: atMatches.length });
+             const matchCountLabel = atPopupItems.length === 1 ? t("chat.match") : t("chat.matches", { count: atPopupItems.length });
             // With a truncated index, local results are provisional — the
             // debounced server search over the full listing replaces them.
-            const truncatedHint = fileIndex?.truncated && !serverResultInUse
+            const truncatedHint = !extensionMode && fileIndex?.truncated && !serverResultInUse
                ? (atQuery.query ? t("chat.searchingAll") : t("chat.indexTruncated"))
               : "";
+            const headerLabel = extensionMode
+              ? t("chat.extensionSuggestions", { count: atPopupItems.length })
+              : t("chat.files", { label: matchCountLabel, hint: truncatedHint });
             return (
               <div
                 ref={atMenuRef}
@@ -2123,20 +2267,75 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                   }}
                 >
                   <span>
-                    {indexLoading
+                    {extensionMode
+                      ? headerLabel
+                      : indexLoading
                        ? t("chat.loadingFiles")
-                       : t("chat.files", { label: matchCountLabel, hint: truncatedHint })}
+                       : headerLabel}
                   </span>
                    <span style={{ fontFamily: "var(--font-mono)" }}>{t("chat.tabEnter")}</span>
                 </div>
                 <div style={{ flex: "1 1 auto", minHeight: 0, overflowY: "auto", padding: 4 }}>
-                  {!indexLoading && atMatches.length === 0 ? (
+                  {atPopupItems.length === 0 && (extensionMode || !indexLoading) ? (
                     <div style={{ padding: "6px 8px", fontSize: 12, color: "var(--text-dim)" }}>
-                       {needsServerSearch && !serverResultInUse ? t("chat.searching") : t("chat.noMatchingFiles")}
+                      {extensionMode
+                        ? t("chat.noMatchingSuggestions")
+                        : needsServerSearch && !serverResultInUse ? t("chat.searching") : t("chat.noMatchingFiles")}
                     </div>
                   ) : (
-                    atMatches.map((entry, index) => {
+                    atPopupItems.map((popup, index) => {
                       const active = index === atActiveIndex;
+                      if (popup.kind === "extension") {
+                        const item = popup.item;
+                        return (
+                          <button
+                            key={`ext:${item.value}`}
+                            ref={(node) => {
+                              atItemRefs.current[index] = node;
+                            }}
+                            type="button"
+                            onMouseDown={(e) => {
+                              e.preventDefault();
+                              applyAtPopupCompletion(popup);
+                            }}
+                            onMouseEnter={() => setAtActiveIndex(index)}
+                            style={{
+                              width: "100%",
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                              padding: "6px 8px",
+                              border: "none",
+                              borderRadius: 6,
+                              background: active ? "var(--bg-selected)" : "none",
+                              color: "var(--text)",
+                              cursor: "pointer",
+                              textAlign: "left",
+                              fontSize: 12.5,
+                              fontFamily: "var(--font-mono)",
+                            }}
+                          >
+                            <span style={{ flexShrink: 0, display: "flex", alignItems: "center", color: "var(--text-dim)" }} aria-hidden="true">⚡</span>
+                            <span style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
+                              {item.label}
+                            </span>
+                            {item.description && (
+                              <span style={{
+                                flex: "1 1 auto",
+                                minWidth: 0,
+                                overflow: "hidden",
+                                textOverflow: "ellipsis",
+                                whiteSpace: "nowrap",
+                                fontSize: 11,
+                                color: "var(--text-dim)",
+                              }}>
+                                {item.description}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      }
+                      const entry = popup.entry;
                       const name = entry.path.split("/").pop() ?? entry.path;
                       const dirPrefix = entry.path.slice(0, entry.path.length - name.length);
                       return (
@@ -2148,7 +2347,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                           type="button"
                           onMouseDown={(e) => {
                             e.preventDefault();
-                            applyAtCompletion(entry);
+                            applyAtPopupCompletion(popup);
                           }}
                           onMouseEnter={() => setAtActiveIndex(index)}
                           style={{
@@ -2383,13 +2582,14 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 <polyline points="21 15 16 10 5 21" />
               </svg>
             </button>
-            {/* Model selector - visible always, disabled while the session or switch is busy */}
+            {/* Model selector - visible always. Switching mid-run is allowed:
+                pi re-reads the model before every request, so the running
+                response keeps its model and the next turn uses the new one. */}
             {(modelOptions.length > 0 || model || modelError) && onModelChange && (
               <ModelSelector
                 options={modelOptions}
                 value={model}
                 onChange={onModelChange}
-                disabled={isStreaming}
                 busy={modelSwitching}
                 isAutoSelection={isAutoModelSelection}
                 defaultValue={defaultModel}

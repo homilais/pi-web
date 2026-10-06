@@ -1,5 +1,4 @@
-import type {
-  AgentSessionEvent,
+import type { AgentSessionEvent,
   BashOperations,
   SessionManager,
   SettingsManager,
@@ -8,6 +7,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage as PiAgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ExtensionAutocompleteProvider, ExtensionAutocompleteProviderFactory } from "@/lib/extension-autocomplete";
 
 export interface ContextUsage {
   percent: number | null;
@@ -114,7 +114,7 @@ export interface ExtensionUiContextLike {
   pasteToEditor(text: string): void;
   setEditorText(text: string): void;
   getEditorText(): string;
-  addAutocompleteProvider(): void;
+  addAutocompleteProvider(factory: ExtensionAutocompleteProviderFactory): ExtensionAutocompleteProvider | undefined;
   setEditorComponent(): void;
   getEditorComponent(): undefined;
   readonly theme: Theme;

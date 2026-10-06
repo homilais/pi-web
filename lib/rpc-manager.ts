@@ -5,6 +5,17 @@ import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { validateAgentImages } from "./image-attachments";
+import {
+  appendAutocompleteProvider,
+  AUTOCOMPLETE_PROVIDER_TIMEOUT_MS,
+  createBaseAutocompleteProvider,
+  normalizeAutocompleteSuggestions,
+  resolveAutocompleteEditorState,
+  type ExtensionAutocompleteItem,
+  type ExtensionAutocompleteProvider,
+  type ExtensionAutocompleteRequest,
+  type ExtensionAutocompleteResult,
+} from "./extension-autocomplete";
 import { invalidateModelsCache } from "./models-cache";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import {
@@ -194,6 +205,8 @@ const COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT = new Set([
   "get_commands",
   "extension_ui_response",
   "extension_ui_input",
+  // Read-only autocomplete lookups stay available while a copy runs.
+  "get_autocomplete",
 ]);
 
 export interface RpcSessionStartOptions {
@@ -281,6 +294,9 @@ export class AgentSessionWrapper {
   private activeToolEvents = new Map<string, AgentEvent>();
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
+  // Extension autocomplete providers, in registration order (chained: each
+  // factory received the one before it). Reset when extensions reload.
+  private autocompleteProviders: ExtensionAutocompleteProvider[] = [];
   private activeCustomUis = new Map<string, ActiveCustomUi>();
   private extensionUiAbortController = new AbortController();
   private extensionStatuses = new Map<string, string>();
@@ -710,7 +726,8 @@ export class AgentSessionWrapper {
 
     try {
       // Status reconciliation must not postpone forced cleanup after Stop.
-      if (type !== "get_state") this.resetIdleTimer();
+      // Autocomplete is input jitter: it must not keep an idle session alive.
+      if (type !== "get_state" && type !== "get_autocomplete") this.resetIdleTimer();
       if (this.shouldWaitForExtensions(type)) await this.waitForExtensionsBound();
       if (this.sessionReplacement && !allowedDuringReplacement) {
         throw new Error("Session is being copied to a new session");
@@ -1152,6 +1169,7 @@ export class AgentSessionWrapper {
         const activeToolNames = this.inner.getActiveToolNames();
         await this.waitForExtensionsBound();
         this.extensionStatuses.clear();
+        this.resetAutocompleteProviders();
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
         await this.inner.reload();
@@ -1178,6 +1196,12 @@ export class AgentSessionWrapper {
       case "extension_ui_input": {
         this.handleExtensionUiInput(command.id as string, command.data as string);
         return null;
+      }
+
+      case "get_autocomplete": {
+        // Read-only provider lookup: answered through the POST response and
+        // broadcast on the event stream, never written to the session.
+        return await this.handleAutocompleteRequest(command as unknown as ExtensionAutocompleteRequest);
       }
 
       case "set_auto_retry": {
@@ -1222,6 +1246,52 @@ export class AgentSessionWrapper {
     } finally {
       if (tracksMutation) this.activeMutatingCommands = Math.max(0, this.activeMutatingCommands - 1);
     }
+  }
+
+  /**
+   * Query the extension autocomplete chain. The last provider wins (later
+   * registrations wrap the earlier ones, so they see the composed view).
+   * A result is never an error: no provider, provider rejection, or timeout
+   * all answer with an empty list so typing is never disturbed.
+   */
+  private async handleAutocompleteRequest(command: ExtensionAutocompleteRequest): Promise<ExtensionAutocompleteResult> {
+    const requestId = command.requestId;
+    const fallbackPrefix = command.trigger;
+    const respond = (items: ExtensionAutocompleteItem[], prefix: string): ExtensionAutocompleteResult => {
+      const result: ExtensionAutocompleteResult = {
+        type: "autocomplete_result",
+        requestId,
+        items,
+        prefix,
+      };
+      this.emit(result as unknown as AgentEvent);
+      return result;
+    };
+
+    const provider = this.autocompleteProviders[this.autocompleteProviders.length - 1];
+    if (!provider) return respond([], fallbackPrefix);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), AUTOCOMPLETE_PROVIDER_TIMEOUT_MS);
+    try {
+      const state = resolveAutocompleteEditorState(command);
+      const suggestions = await provider.getSuggestions(state.lines, state.cursorLine, state.cursorCol, {
+        signal: controller.signal,
+        force: true,
+      });
+      const normalized = normalizeAutocompleteSuggestions(suggestions, fallbackPrefix);
+      return respond(normalized.items, normalized.prefix);
+    } catch (e) {
+      console.error("[pi-web] handleAutocompleteRequest error:", e instanceof Error ? e.message : e);
+      return respond([], fallbackPrefix);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  /** Extensions re-register their autocomplete providers on every session_start. */
+  private resetAutocompleteProviders(): void {
+    this.autocompleteProviders.length = 0;
   }
 
   /**
@@ -1871,7 +1941,20 @@ export class AgentSessionWrapper {
         } as ExtensionUiRequest as AgentEvent);
       },
       getEditorText: () => "",
-      addAutocompleteProvider: () => {},
+      addAutocompleteProvider: (factory) => {
+        try {
+          // TUI extensions assume a base provider always exists (the terminal
+          // editor registers one) — seed the chain so `current.` dereferences
+          // in first factories do not throw.
+          if (this.autocompleteProviders.length === 0) {
+            this.autocompleteProviders.push(createBaseAutocompleteProvider());
+          }
+          return appendAutocompleteProvider(this.autocompleteProviders, factory);
+        } catch (e) {
+          console.error("[pi-web] addAutocompleteProvider error:", e instanceof Error ? e.message : e);
+          return undefined;
+        }
+      },
       setEditorComponent: () => {},
       getEditorComponent: () => undefined,
       get theme() { return PLAIN_TEXT_THEME; },
@@ -1896,6 +1979,7 @@ export class AgentSessionWrapper {
       switchSession: async () => ({ cancelled: true }),
       reload: async () => {
         this.extensionStatuses.clear();
+        this.resetAutocompleteProviders();
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
         await this.inner.reload({
